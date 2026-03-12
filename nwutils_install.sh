@@ -2,9 +2,9 @@
 set -e
 
 #Usage
-#curl -fsSL https://raw.githubusercontent.com/slashroot79/nwutils/refs/heads/master/nwutils_install.sh | bash
+#curl -fsSL https://raw.githubusercontent.com/azureossd/networking-troubleshooting-utility/refs/heads/main/nwutils_install.sh | bash
 
-URL="https://raw.githubusercontent.com/slashroot79/nwutils/refs/heads/master/nwutils.sh"
+URL="https://raw.githubusercontent.com/azureossd/networking-troubleshooting-utility/refs/heads/main/nwutils.sh"
 INSTALL_PATH="/usr/local/bin/nwutils"
 
 echo "[*] Installing nwutils to $INSTALL_PATH..."

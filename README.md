@@ -40,4 +40,4 @@ List of tools: nmap netcat-openbsd tcpdump dnsutils iproute2 iftop net-tools ipt
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/slashroot79/nwutils/refs/heads/master/nwutils_install.sh | bash
-
+```
