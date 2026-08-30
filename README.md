@@ -8,12 +8,12 @@ and a self-contained HTML report.
 
 ---
 
-## Mental model
+## Primary actions
 
-Three primary actions:
-
-- **probe** — active live tests (DNS + reachability + connectivity). No capture.
-- **trace** — passive evidence: capture a `.pcap`, then analyze it.
+- **probe** — live tests (DNS + reachability + connectivity). No capture.
+- **capture** — record a `.pcap` only.
+- **analyze** — analyze an existing `.pcap`, offline.
+- **trace** — capture a `.pcap`, then analyze it.
 - **run** — everything: `probe` + `trace` + a unified report.
 
 `capture` and `analyze` are the atomic halves of `trace`, so you can capture on one machine and
