@@ -9,16 +9,37 @@
 # 3. run: Interactive mode to detect outbound connections and run diagnostics.
 # ==============================================================================
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="2.0.0"
 
-# Default log dir - applicable for Azure Linux App Services
-LOG_DIR="/home/Logfiles"
+# Default capture duration (seconds) for capture/trace/run. Ctrl-C stops early.
+CAPTURE_DURATION_DEFAULT=180
 
-# Create a custom log dir (/Appuserlogs) in IaaS or non App Service hosts. Imp: Enable storage in Custom Containers (App Service). 
-if [ ! -d "$LOG_DIR" ] || [ ! -w "$LOG_DIR" ]; then
-    LOG_DIR="/Appuserlogs"
-    mkdir -p "$LOG_DIR" || { echo "Failed to create log directory $LOG_DIR"; exit 1; }
-fi
+# Cross-function session state (valid for a single script invocation only)
+CAPTURED_PCAP=""   # last .pcap produced by do_capture
+PROBE_NC_RC=""     # reachability result code from the most recent do_probe
+PROBE_TARGET=""    # target that PROBE_NC_RC applies to
+USE_ASCII=0        # 1 = plain-ASCII UI (no box-drawing); set by --ascii
+
+# Log directory selection, in priority order, so the tool runs anywhere:
+#   1) $NWUTILS_LOG_DIR   explicit override (also handy for testing)
+#   2) /home/Logfiles     Azure App Service persistent storage
+#   3) /Appuserlogs       custom containers / IaaS (enable storage in App Service)
+#   4) $TMPDIR|/tmp       fallback that works on almost every Linux
+#   5) ./nwutils-out      last resort in the current directory
+select_log_dir() {
+    local candidates=() d
+    [ -n "${NWUTILS_LOG_DIR:-}" ] && candidates+=("$NWUTILS_LOG_DIR")
+    candidates+=("/home/Logfiles" "/Appuserlogs" "${TMPDIR:-/tmp}/nwutils" "./nwutils-out")
+    for d in "${candidates[@]}"; do
+        mkdir -p "$d" 2>/dev/null || continue
+        [ -w "$d" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+LOG_DIR="$(select_log_dir)" || {
+    echo "Failed to find a writable log directory. Set NWUTILS_LOG_DIR to override." >&2
+    exit 1
+}
 
 # Create Log files
 LOG_FILE="$LOG_DIR/nwutils.log"
@@ -79,6 +100,27 @@ validate_host() {
         return 0
     fi
     return 1
+}
+
+# Resolve a hostname to its first IPv4 address.
+# Echoes the IP, or the original input if it is already an IP or cannot be resolved.
+# Used so the tcpdump BPF filter and the later tshark ip.addr filter agree.
+resolve_host() {
+    local host="$1"
+    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        echo "$host"; return 0
+    fi
+    local ip=""
+    if command -v dig &>/dev/null; then
+        ip=$(dig +short "$host" A 2>/dev/null | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)
+    fi
+    if [ -z "$ip" ] && command -v getent &>/dev/null; then
+        ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+    fi
+    if [ -z "$ip" ] && command -v nslookup &>/dev/null; then
+        ip=$(nslookup "$host" 2>/dev/null | awk '/^Address: /{print $2; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+    fi
+    echo "${ip:-$host}"
 }
 
 # INSTALLATION
@@ -272,99 +314,162 @@ run_nping() {
     log_message "[nping] Test complete."
 }
 
-# Network diagnostics helper function
-# Usage: run_diagnostics <target_ip_or_fqdn> <port>
-run_diagnostics() {
-    local target_ip="$1"
+# ==============================================================================
+# PROBE — active, live tests (DNS + reachability + connectivity). No capture.
+# Usage: do_probe <host_or_ip> <port>
+# ==============================================================================
+do_probe() {
+    local target="$1"
     local target_port="$2"
 
-    # Generate a unique pcap file per run so multiple-port calls don't clobber each other
-    local safe_target="${target_ip//[^a-zA-Z0-9]/_}"
-    local pcap_file="$LOG_DIR/nwutils_${safe_target}_${target_port}_$(date +%s).pcap"
-
     log_message "=========================================================="
-    log_message "Starting diagnostics: $target_ip  port $target_port"
+    log_message "PROBE (active tests): $target  port $target_port"
     log_message "=========================================================="
 
-    # --- [1/5] DNS resolution ---
+    # --- DNS resolution ---
     log_message ""
-    log_message "[1/5] DNS Lookup"
-    dns_lookup "$target_ip"
+    log_message "[probe 1/4] DNS Lookup"
+    dns_lookup "$target"
     log_message "----------------------------------------------------------"
 
-    # --- [2/5] TCP Reachability: nc ---
+    # --- Reachability: nc (+ nmap when available) ---
     log_message ""
-    log_message "[2/5] TCP Reachability test (nc)"
-    local nc_output
-    local nc_rc
-    nc_output=$(nc -zv -w 3 "$target_ip" "$target_port" 2>&1)
+    log_message "[probe 2/4] Reachability test (nc / nmap) — is the port open, closed, or filtered?"
+    local nc_output nc_rc
+    nc_output=$(nc -zv -w 3 "$target" "$target_port" 2>&1)
     nc_rc=$?
     if [ $nc_rc -eq 0 ]; then
-        log_message "  [nc] SUCCESS: $target_ip:$target_port is reachable."
-        echo "  [nc] Detailed output: $nc_output" >> "$LOG_FILE" # logged to file only
+        log_message "  [nc] SUCCESS: $target:$target_port is reachable (port OPEN)."
+        echo "  [nc] Detailed output: $nc_output" >> "$LOG_FILE"
     else
-        log_message "  [nc] FAILED: $target_ip:$target_port is NOT reachable."
+        log_message "  [nc] FAILED: $target:$target_port is NOT reachable."
         log_message "  [nc] Details: $nc_output"
-        log_message "  [nc] Action: Check NSGs/Firewalls, validate IP/Port, or review the packet capture below."
+        log_message "  [nc] Action: Check NSGs/Firewalls, validate IP/Port, or capture a trace (nwutils trace)."
     fi
+    # nmap adds the open/closed/filtered distinction with a reason
+    if command -v nmap &>/dev/null; then
+        local nmap_out
+        nmap_out=$(nmap -Pn -p "$target_port" --reason "$target" 2>/dev/null | grep -E "^${target_port}/|Host is")
+        [ -n "$nmap_out" ] && echo "$nmap_out" | sed 's/^/  [nmap] /' | tee -a "$LOG_FILE"
+    fi
+    # Record reachability so a later do_analyze in the same run can use it
+    PROBE_NC_RC="$nc_rc"
+    PROBE_TARGET="$target"
     log_message "----------------------------------------------------------"
 
-    # --- [3/5] HTTP/HTTPS response check (curl) — web ports only ---
+    # --- Connectivity: curl end-to-end (real HTTP status, works for HTTPS) ---
     log_message ""
     if [[ "$target_port" == "80" || "$target_port" == "443" || "$target_port" == "8080" || "$target_port" == "8443" ]]; then
-        log_message "[3/5] HTTP response check (curl)"
+        log_message "[probe 3/4] Connectivity test (curl) — end-to-end TLS + HTTP status + timing"
         local scheme="http"
         [[ "$target_port" == "443" || "$target_port" == "8443" ]] && scheme="https"
         local curl_out
         curl_out=$(curl -sk --max-time 5 -o /dev/null \
-            -w "HTTP %{http_code} | Connect: %{time_connect}s | TTFB: %{time_starttransfer}s | Total: %{time_total}s" \
-            "${scheme}://${target_ip}:${target_port}/" 2>&1)
+            -w "HTTP %{http_code} | DNS: %{time_namelookup}s | Connect: %{time_connect}s | TLS: %{time_appconnect}s | TTFB: %{time_starttransfer}s | Total: %{time_total}s" \
+            "${scheme}://${target}:${target_port}/" 2>&1)
         log_message "  [curl] $curl_out"
     else
-        log_message "[3/5] HTTP check skipped (port $target_port is not a standard web port)"
+        log_message "[probe 3/4] Connectivity test skipped (port $target_port is not a standard web port for curl)"
     fi
     log_message "----------------------------------------------------------"
 
-    # --- [4/5] TCP Connectivity & latency: nping ---
+    # --- TCP connect latency: nping ---
     log_message ""
-    log_message "[4/5] TCP Connectivity & latency test (nping)"
-    run_nping "$target_ip" "$target_port"
+    log_message "[probe 4/4] TCP connect latency (nping)"
+    run_nping "$target" "$target_port"
     log_message "----------------------------------------------------------"
+    log_message "PROBE complete: $target:$target_port"
+    log_message "=========================================================="
+}
 
-    # --- [5/5] Packet capture (60s) filtered to target traffic + DNS ---
-    log_message ""
-    log_message "[5/5] Packet capture (60s) — capturing traffic to $target_ip:$target_port and DNS..."
+# ==============================================================================
+# CAPTURE — record a tcpdump (.pcap) of target traffic + DNS. Needs root/sudo.
+# Usage: do_capture <host_or_ip> <port> [duration_seconds]
+# Sets global CAPTURED_PCAP to the resulting file path.
+# ==============================================================================
+do_capture() {
+    local target="$1"
+    local target_port="$2"
+    local duration="${3:-$CAPTURE_DURATION_DEFAULT}"
 
-    # Apply the BPF filter at capture time: reduces disk usage and I/O noise
+    # Resolve to an IP so the tcpdump filter and later tshark analysis agree
+    local target_ip
+    target_ip=$(resolve_host "$target")
+
+    local safe_target="${target//[^a-zA-Z0-9]/_}"
+    local pcap_file="$LOG_DIR/nwutils_${safe_target}_${target_port}_$(date +%s).pcap"
+    CAPTURED_PCAP="$pcap_file"
+
+    log_message "=========================================================="
+    log_message "CAPTURE: $target ($target_ip) port $target_port — up to ${duration}s (Ctrl-C to stop early)"
+    log_message "=========================================================="
+
+    # Filter at capture time to reduce noise: target host+port plus all DNS
     local -a tcpdump_args=(-i any -tttt -nn -U -w "$pcap_file"
         "(host $target_ip and port $target_port) or port 53")
 
+    # Trap Ctrl-C so it stops tcpdump but lets the script continue to analysis
+    trap 'log_message "  Capture interrupted (Ctrl-C) — stopping tcpdump and continuing..."' INT
     if [ "$EUID" -ne 0 ]; then
         log_message "  Using sudo for tcpdump..."
-        sudo timeout 60 tcpdump "${tcpdump_args[@]}" >/dev/null 2>&1
+        sudo timeout "$duration" tcpdump "${tcpdump_args[@]}" >/dev/null 2>&1
     else
-        timeout 60 tcpdump "${tcpdump_args[@]}" >/dev/null 2>&1
+        timeout "$duration" tcpdump "${tcpdump_args[@]}" >/dev/null 2>&1
     fi
+    trap - INT
+
     log_message "  Packet capture saved to: $pcap_file"
-    log_message "----------------------------------------------------------"
+    log_message "=========================================================="
+}
+
+# ==============================================================================
+# ANALYZE — offline analysis of a .pcap: DNS analysis, per-stream TCP table,
+# health report, and plain-English summary. Needs neither root nor the network.
+# Usage: do_analyze <pcap_file> [host_or_ip] [port]
+# ==============================================================================
+do_analyze() {
+    local pcap_file="$1"
+    local target="${2:-}"
+    local target_port="${3:-}"
+
+    # Resolve host to a numeric IP for tshark filters (ip.addr needs an IP)
+    local target_ip=""
+    [ -n "$target" ] && target_ip=$(resolve_host "$target")
+
+    # Build the TCP display filter dynamically so standalone captures still work
+    local tcp_filter="tcp"
+    [ -n "$target_port" ] && tcp_filter="$tcp_filter && tcp.port == $target_port"
+    [ -n "$target_ip" ]   && tcp_filter="$tcp_filter && ip.addr == $target_ip"
+
+    log_message "=========================================================="
+    log_message "ANALYZE: $pcap_file${target:+  (target $target${target_port:+:$target_port})}"
+    log_message "=========================================================="
 
     # --- Pre-analysis checks ---
     log_message ""
+    if [ ! -f "$pcap_file" ]; then
+        log_message "  Error: Capture file not found: $pcap_file"
+        return 1
+    fi
     if [ ! -s "$pcap_file" ]; then
-        log_message "  Warning: Pcap file is empty — capture failed or no matching packets found."
-        log_message "  Hint: Ensure traffic to $target_ip:$target_port occurred during the 60s capture window."
-        return
+        log_message "  Warning: Pcap file is empty — capture failed or no matching packets were seen."
+        log_message "  Hint: Ensure traffic to the target occurred during the capture window."
+        return 1
     fi
     if ! command -v tshark &>/dev/null; then
         log_message "  [tshark] Not installed — skipping packet analysis. Pcap saved for manual review."
-        return
+        return 1
     fi
 
-    # Temp file used to pass numeric stats from awk subshells back to bash for the health report
+    # Temp file used to pass numeric stats from awk subshells back to bash
     local stats_file
     stats_file=$(mktemp)
-    # Seed the nc reachability result (set earlier in this function)
-    printf "nc_rc=%d\n" "$nc_rc" > "$stats_file"
+    # Seed reachability result if a probe ran for this same target in this run
+    if [ -n "$PROBE_NC_RC" ] && [ "$PROBE_TARGET" == "$target" ]; then
+        printf "nc_rc=%d\n" "$PROBE_NC_RC" > "$stats_file"
+    else
+        printf "nc_rc=%d\n" 1 > "$stats_file"
+    fi
 
     # -----------------------------------------------------------------------
     # [5b/6] DNS Analysis
@@ -442,7 +547,7 @@ run_diagnostics() {
     echo "" | tee -a "$LOG_FILE"
 
     tshark -r "$pcap_file" \
-        -Y "tcp.port == $target_port && ip.addr == $target_ip" \
+        -Y "$tcp_filter" \
         -T fields \
         -e tcp.stream \
         -e frame.time_relative \
@@ -460,7 +565,7 @@ run_diagnostics() {
         -e tcp.analysis.duplicate_ack \
         -e tcp.window_size_value \
         -E header=n -E separator=/t -E quote=d 2>/dev/null | \
-    awk -F'\t' -v sf="$stats_file" '
+    awk -F'\t' -v sf="$stats_file" -v tip="$target_ip" '
     BEGIN {
         fmt  = "%-12s | %-8s | %-44s | %-6s | %-9s | %-6s | %-9s | %-3s | %-3s | %-3s | %-3s\n";
         sep  = "---------------------------------------------------------------------------------------------------------------------------------------";
@@ -471,6 +576,7 @@ run_diagnostics() {
         cur_stream = -1;
         total=0; retrans=0; rst=0; fin=0; syn=0; synack=0;
         zw=0; ls=0; da=0; rtt_sum=0; rtt_n=0; rtt_max=0;
+        srv_close=0; cli_close=0; unk_close=0;
     }
     {
         gsub(/"/, "", $0);
@@ -519,6 +625,14 @@ run_diagnostics() {
         if (flags ~ /F/) fin++;
         if (flags ~ /S/ && flags !~ /A/) syn++;
         if (flags ~ /S/ && flags ~ /A/)  synack++;
+
+        # Attribute the FIRST FIN/RST per stream to whoever sent it
+        if ((flags ~ /R/ || flags ~ /F/) && !(stream in closed)) {
+            closed[stream] = 1;
+            if      (tip != "" && src == tip) srv_close++;
+            else if (tip != "")               cli_close++;
+            else                              unk_close++;
+        }
         total++;
 
         printf fmt, time, iface, direction, pf, rtt_val, len, delta, r_f, zw_f, ls_f, da_f;
@@ -531,9 +645,14 @@ run_diagnostics() {
         printf "  RTT: %.2f ms avg | %.2f ms max | %d samples\n", avg_rtt, rtt_max, rtt_n;
         if (syn > 0 && synack == 0)
             printf "  NOTE: %d SYN(s) sent, 0 SYN-ACK(s) received — port may be FILTERED or host UNREACHABLE\n", syn;
+        if (srv_close > 0 || cli_close > 0 || unk_close > 0)
+            printf "  CLOSE: %d closed first by SERVER | %d by CLIENT | %d unattributed\n", srv_close, cli_close, unk_close;
 
         # Append TCP stats for health report
         printf "tcp_total=%d\n",    total   >> sf;
+        printf "tcp_srv_close=%d\n", srv_close >> sf;
+        printf "tcp_cli_close=%d\n", cli_close >> sf;
+        printf "tcp_unk_close=%d\n", unk_close >> sf;
         printf "tcp_retrans=%d\n",  retrans >> sf;
         printf "tcp_rst=%d\n",      rst     >> sf;
         printf "tcp_fin=%d\n",      fin     >> sf;
@@ -555,6 +674,10 @@ run_diagnostics() {
     # shellcheck disable=SC1090
     [ -s "$stats_file" ] && source "$stats_file"
     rm -f "$stats_file"
+
+    # tshark passes are done; from here target_ip/target_port are display-only
+    [ -z "$target_ip" ]   && target_ip="${target:-$(basename "$pcap_file")}"
+    [ -z "$target_port" ] && target_port="all"
 
     # ── DNS ─────────────────────────────────────────────────────────────────
     local dns_status
@@ -794,105 +917,303 @@ run_diagnostics() {
             echo "  Connection Closes: No RST or unexpected FIN packets observed."
         fi
 
+        # ── Who closed first (client vs server) ──────────────────────────────
+        if [ "${tcp_srv_close:-0}" -gt 0 ] || [ "${tcp_cli_close:-0}" -gt 0 ]; then
+            echo ""
+            echo "  Who Closed First: ${tcp_srv_close:-0} stream(s) closed first by the SERVER (remote),"
+            echo "       ${tcp_cli_close:-0} by the CLIENT (this host)${tcp_unk_close:+, ${tcp_unk_close} unattributed}."
+            if [ "${tcp_srv_close:-0}" -gt "${tcp_cli_close:-0}" ]; then
+                echo "       The remote end is initiating most closes — investigate server-side idle"
+                echo "       timeouts, load-balancer limits, or upstream app restarts/crashes."
+            elif [ "${tcp_cli_close:-0}" -gt 0 ]; then
+                echo "       This host is initiating most closes — usually normal request completion,"
+                echo "       but check client-side timeouts if closes look premature."
+            fi
+        fi
+
         echo ""
         echo "  Full packet data available for manual review: $pcap_file"
         echo ""
     } | tee -a "$LOG_FILE"
 
     log_message "----------------------------------------------------------"
-    log_message "Diagnostics complete: $target_ip:$target_port"
+    log_message "ANALYZE complete: $target_ip:$target_port"
     log_message "----------------------------------------------------------"
 }
 
-# Tests connectivity to a target on specified ports.
-# Usage: test_connectivity "target.com" "80" "443"
-test_connectivity() {
-    local target="$1"
-    # Create an array of ports from the rest of the arguments
-    local ports=("${@:2}")
+# ── UI helpers (simple, portable framing with ASCII fallback) ────────────────
+NW_RULE="──────────────────────────────────────────────────────────────────────────────"
+NW_RULE_ASCII="------------------------------------------------------------------------------"
+ui_line() { if [ "${USE_ASCII:-0}" -eq 1 ]; then echo "$NW_RULE_ASCII"; else echo "$NW_RULE"; fi; }
 
-    log_message "*** Starting tests for $target on port(s): ${ports[*]} ***"
-    log_message "**********************************************************"
-    
-    # Check for required tools actually used in diagnostics
-    check_tools "nc" "tcpdump" "tshark"
+# Best-effort reverse DNS (PTR) for display. Empty if none.
+reverse_lookup() {
+    local ip="$1" name="" TO=""
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo ""; return; }
+    command -v timeout &>/dev/null && TO="timeout 2"
+    if command -v dig &>/dev/null; then
+        name=$($TO dig +short -x "$ip" 2>/dev/null | head -n1 | sed 's/\.$//')
+    fi
+    if [ -z "$name" ] && command -v getent &>/dev/null; then
+        name=$($TO getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')
+    fi
+    echo "$name"
+}
 
-    for port in "${ports[@]}"; do
-        run_diagnostics "$target" "$port"
+# ── Outbound-connection detectors (ss → netstat → /proc fallback) ─────────────
+# Each emits normalized lines: STATE|IP|PORT|PROCESS
+_detect_ss() {
+    ss -tnp state connected 2>/dev/null | awk '
+    NR==1 && /State/ { next }
+    {
+        local_ap=""; peer_ap=""; proc="-"; n=0;
+        for (i=1;i<=NF;i++) {
+            if ($i ~ /:[0-9]+$/) { n++; if (n==1) local_ap=$i; else if (n==2) peer_ap=$i; }
+            if ($i ~ /users:/) proc=$i;
+        }
+        if (peer_ap=="") next;
+        st=$1; if (st !~ /^[A-Za-z-]+$/) st="ESTAB";
+        pport=peer_ap; sub(/.*:/,"",pport);
+        pip=peer_ap;   sub(/:[0-9]+$/,"",pip); gsub(/[][]/,"",pip);
+        pname="-"; if (match(proc,/"[^"]+"/)) pname=substr(proc,RSTART+1,RLENGTH-2);
+        print st "|" pip "|" pport "|" pname;
+    }'
+}
+_detect_netstat() {
+    netstat -tnp 2>/dev/null | awk '
+    /^tcp/ {
+        peer_ap=$5; st=$6; proc=$7;
+        pport=peer_ap; sub(/.*:/,"",pport);
+        pip=peer_ap;   sub(/:[0-9]+$/,"",pip); gsub(/[][]/,"",pip);
+        pname=proc; sub(/.*\//,"",pname); if (pname=="") pname="-";
+        print st "|" pip "|" pport "|" pname;
+    }'
+}
+_detect_proc() {
+    local f
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$f" ] || continue
+        awk 'NR>1 {
+            st=$4; if (st!="01" && st!="02") next;
+            split($3,r,":"); ipx=r[1]; portx=r[2];
+            port=strtonum("0x" portx);
+            if (length(ipx)==8) {
+                a=strtonum("0x" substr(ipx,7,2)); b=strtonum("0x" substr(ipx,5,2));
+                c=strtonum("0x" substr(ipx,3,2)); d=strtonum("0x" substr(ipx,1,2));
+                ip=a"."b"."c"."d;
+            } else ip="(ipv6)";
+            print (st=="01"?"ESTAB":"SYN-SENT") "|" ip "|" port "|-";
+        }' "$f" 2>/dev/null
     done
+}
+
+# Populate global DETECTED_CONNS[] with "COUNT|STATE|IP|PORT|PROC", busiest first.
+detect_outbound_connections() {
+    DETECTED_CONNS=()
+    local raw=""
+    if   command -v ss      &>/dev/null; then raw=$(_detect_ss)
+    elif command -v netstat &>/dev/null; then raw=$(_detect_netstat)
+    else                                      raw=$(_detect_proc)
+    fi
+
+    # Drop loopback, link-local, wildcard, and SSH(22)
+    raw=$(printf '%s\n' "$raw" \
+        | awk -F'|' 'NF>=3 && $2!="" && $2!="*" && $2!="0.0.0.0" && $2!="127.0.0.1" && $2!="::1" && $3!="22" && $2 !~ /^169\.254\./ {print}')
+
+    declare -A cnt state
+    local st ip port proc key
+    while IFS='|' read -r st ip port proc; do
+        [ -z "$ip" ] && continue
+        key="$ip|$port|$proc"
+        cnt["$key"]=$(( ${cnt["$key"]:-0} + 1 ))
+        if [ "${state[$key]:-}" != "SYN-SENT" ]; then state["$key"]="$st"; fi
+    done <<< "$raw"
+
+    local sorted k
+    sorted=$(for k in "${!cnt[@]}"; do printf '%s|%s|%s\n' "${cnt[$k]}" "${state[$k]}" "$k"; done | sort -t'|' -k1,1 -rn)
+    while IFS= read -r k; do
+        [ -n "$k" ] && DETECTED_CONNS+=("$k")
+    done <<< "$sorted"
+}
+
+# ── TRACE = capture + analyze ─────────────────────────────────────────────────
+do_trace() {
+    local target="$1" target_port="$2" duration="${3:-$CAPTURE_DURATION_DEFAULT}"
+    check_tools "tcpdump" "tshark"
+    do_capture "$target" "$target_port" "$duration"
+    do_analyze "$CAPTURED_PCAP" "$target" "$target_port"
+}
+
+# ── RUN = probe + trace + HTML report ─────────────────────────────────────────
+do_run() {
+    local target="$1" target_port="$2" duration="${3:-$CAPTURE_DURATION_DEFAULT}"
+    check_tools "nc" "tcpdump" "tshark"
     log_message "**********************************************************"
+    log_message "RUN: full workflow for $target:$target_port"
+    log_message "**********************************************************"
+    do_probe   "$target" "$target_port"
+    do_capture "$target" "$target_port" "$duration"
+    do_analyze "$CAPTURED_PCAP" "$target" "$target_port"
     generate_html_report
 }
 
-# RUN 
+# ── CHECK = inventory installed tools ─────────────────────────────────────────
+check_inventory() {
+    log_message "*** Tool inventory ***"
+    local tools="curl wget dig nslookup nc nmap nping tcpdump tshark ss netstat ip traceroute mtr iftop nethogs iptraf-ng nload lsof"
+    local t present=0 total=0
+    for t in $tools; do
+        total=$((total+1))
+        if command -v "$t" &>/dev/null; then
+            printf "  +  %-14s installed\n" "$t" | tee -a "$LOG_FILE"
+            present=$((present+1))
+        else
+            printf "  -  %-14s missing\n" "$t" | tee -a "$LOG_FILE"
+        fi
+    done
+    log_message "Installed: $present / $total tools. Run 'nwutils install' to add the full toolkit."
+}
+
+# ── SUGGEST = print copy-paste commands tailored to a target ──────────────────
+suggest_commands() {
+    local host="${1:-<host>}" port="${2:-443}"
+    cat <<EOF
+
+nwutils — suggested manual commands for ${host}:${port}
+(Copy-paste the ones you need. Nothing here is executed.)
+
+DNS
+  dig ${host}
+  dig +trace ${host}
+  dig -x <ip>                          # reverse lookup
+  nslookup ${host}
+
+Reachability (is the port open / closed / filtered?)
+  nc -zv -w 5 ${host} ${port}
+  nmap -p ${port} --reason ${host}
+  nping --tcp-connect -p ${port} -c 5 ${host}
+
+Connectivity (end-to-end: TLS + HTTP status + timing)
+  curl -o /dev/null -s -w 'DNS:%{time_namelookup} TCP:%{time_connect} TLS:%{time_appconnect} TTFB:%{time_starttransfer} total:%{time_total} code:%{http_code}\n' https://${host}:${port}/
+  curl -vvv https://${host}:${port}/ 2>&1 | head -50
+
+Capture (needs root/sudo)
+  tcpdump -i any -s 0 -tttt -U -nn -w trace.pcap '(host ${host} and port ${port}) or port 53'
+  tcpdump -i any -nn -s 0 -w resets.pcap 'tcp[tcpflags] & (tcp-rst|tcp-fin) != 0'
+
+Analyze a capture
+  tshark -r trace.pcap -Y "dns"
+  tshark -r trace.pcap -Y "tcp.flags.reset == 1"
+  tshark -r trace.pcap -Y "tcp.analysis.retransmission"
+  tshark -r trace.pcap -q -z conv,tcp
+
+Or let nwutils do it for you
+  nwutils probe ${host} ${port}
+  nwutils trace ${host} ${port}
+  nwutils run   ${host} ${port}
+EOF
+}
+
+# ── INTERACTIVE = guided 3-stage menu (detect → confirm/edit → probe/trace/run)
 run_interactive() {
-    log_message "*** Beginning tests in Interactive Mode ***"
-    log_message "**********************************************************"
-    # nc, tcpdump, tshark are used in run_diagnostics; ss/netstat for connection detection
-    check_tools "nc" "tcpdump" "tshark"
+    log_message "*** Interactive Mode ***"
+    local sel_host="" sel_ip="" sel_port="" choice e np a
 
-    local target_ip=""
-    local target_port=""
+    while true; do
+        # ---- Stage 1: detect outbound connections and pick one ----
+        echo ""
+        echo "Scanning active outbound connections..."
+        detect_outbound_connections
+        echo ""
+        ui_line
+        printf "  %-3s %-16s %-30s %-6s %-9s %s\n" "#" "PROCESS" "DESTINATION (PTR or IP)" "PORT" "STATE" "CONNS"
+        ui_line
+        if [ "${#DETECTED_CONNS[@]}" -eq 0 ]; then
+            echo "  (none detected — choose [m] to enter a target manually)"
+        else
+            local i=1 entry c st ip port proc ptr flag
+            for entry in "${DETECTED_CONNS[@]}"; do
+                IFS='|' read -r c st ip port proc <<< "$entry"
+                ptr=$(reverse_lookup "$ip")
+                flag=""; [ "$st" = "SYN-SENT" ] && flag="  <- connecting/failing"
+                printf "  %-3s %-16s %-30s %-6s %-9s %s%s\n" "$i" "${proc:0:16}" "${ptr:-$ip}" "$port" "$st" "$c" "$flag"
+                i=$((i+1))
+            done
+        fi
+        ui_line
+        echo "  [1-N] select   [m] manual entry   [r] rescan   [q] quit"
+        printf "> "; read -r choice
 
-    # Detect outbound IP and port.
-    # Prompt only for port number
-    read -p "Enter the destination Port to test: " target_port
+        case "$choice" in
+            q|Q) echo "Leaving interactive mode."; return 0 ;;
+            r|R) continue ;;
+            '')  continue ;;
+            m|M)
+                printf "Enter destination host or IP: "; read -r sel_host
+                [ -z "$sel_host" ] && { echo "No host entered."; continue; }
+                validate_host "$sel_host" || { echo "Invalid host/IP."; continue; }
+                sel_ip=$(resolve_host "$sel_host")
+                printf "Enter destination port: "; read -r sel_port
+                validate_port "$sel_port" || { echo "Invalid port."; continue; }
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#DETECTED_CONNS[@]}" ]; then
+                    local c st ip port proc
+                    IFS='|' read -r c st ip port proc <<< "${DETECTED_CONNS[$((choice-1))]}"
+                    sel_ip="$ip"; sel_port="$port"
+                    sel_host=$(reverse_lookup "$ip"); [ -z "$sel_host" ] && sel_host="$ip"
+                else
+                    echo "Invalid selection."; continue
+                fi
+                ;;
+        esac
 
-    # Validate port
-    if ! validate_port "$target_port"; then
-        log_message "Error: Invalid port specified: '$target_port'. Must be an integer between 1-65535."
-        exit 1
-    fi
+        # ---- Stage 2: confirm / edit the target ----
+        while true; do
+            echo ""; ui_line
+            echo "  Target"
+            printf "    Host : %s\n" "${sel_host:-<none>}"
+            printf "    IP   : %s\n" "${sel_ip:-<none>}"
+            printf "    Port : %s\n" "${sel_port:-<none>}"
+            ui_line
+            echo "  [Enter] confirm   [h] edit host   [i] edit IP   [p] edit port   [b] back"
+            printf "> "; read -r e
+            case "$e" in
+                '') break ;;
+                h|H) printf "New host: "; read -r sel_host; [ -n "$sel_host" ] && sel_ip=$(resolve_host "$sel_host") ;;
+                i|I) printf "New IP: ";   read -r sel_ip ;;
+                p|P) printf "New port: "; read -r np; if validate_port "$np"; then sel_port="$np"; else echo "Invalid port."; fi ;;
+                b|B) continue 2 ;;
+                *) : ;;
+            esac
+        done
 
-    local connection
-    local peer_field
-    local proc_field
-    log_message "Detecting active outbound connection for port $target_port..."
+        if [ -z "$sel_port" ] || { [ -z "$sel_host" ] && [ -z "$sel_ip" ]; }; then
+            echo "Target incomplete; returning to detection."; continue
+        fi
+        local tgt="${sel_host:-$sel_ip}"
 
-    # Prefer 'ss' (modern replacement for netstat); fall back to 'netstat'
-    if command -v ss &>/dev/null; then
-        # ss output: netid state recv-q send-q local-addr:port peer-addr:port process
-        # Fields:    $1    $2    $3     $4     $5               $6             $7
-        connection=$(ss -tunp 2>/dev/null | grep -v '127.0.0.1' | grep -v '::1' | grep -v ':22 ' | grep ":$target_port ")
-        peer_field=6
-        proc_field=7
-    elif command -v netstat &>/dev/null; then
-        # netstat output: proto recv-q send-q local-addr foreign-addr state pid/prog
-        # Fields:         $1    $2     $3     $4         $5           $6    $7
-        connection=$(netstat -tunp 2>/dev/null | grep -v '127.0.0.1' | grep -v '::1' | grep -v ':22 ' | grep ":$target_port ")
-        peer_field=5
-        proc_field=7
-    else
-        log_message "Error: Neither 'ss' nor 'netstat' is available. Cannot detect active connections."
-        exit 1
-    fi
-
-    if [ -z "$connection" ]; then
-        log_message "No ACTIVE outbound connection found for port $target_port. If possible, trigger outbound n/w transactions and try again."
-        exit 0
-    fi
-
-    target_ip=$(echo "$connection" | awk -v f="$peer_field" '{print $f}' | cut -d':' -f1 | sed 's/\[//;s/\]//' | head -n1)
-    # Extract Process name
-    local process_info
-    local process_name
-    process_info=$(echo "$connection" | awk -v f="$proc_field" '{print $f}' | head -n1)
-    # ss wraps process info as users:(("name",pid=N,fd=M)); netstat uses pid/name
-    if [[ "$process_info" == users* ]]; then
-        process_name=$(echo "$process_info" | grep -oP '"\K[^"]+' | head -n1)
-    else
-        process_name=$(echo "$process_info" | cut -d'/' -f2)
-    fi
-
-    read -p "Detected application process: $process_name , destination: $target_ip:$target_port. Proceed with diagnostics? (y/n): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        log_message "Diagnostics canceled by user."
-        echo "Run diagnostics manually as needed. Ex: nwutils <fqdn> <port>. See nwutils -h for more options."
-        exit 0
-    fi
-    run_diagnostics "$target_ip" "$target_port"
-    log_message "**********************************************************"
-    generate_html_report
+        # ---- Stage 3: choose an action (probe / trace / run) ----
+        while true; do
+            echo ""; ui_line
+            printf "  Target: %s (%s) : %s\n" "${sel_host:-$sel_ip}" "${sel_ip:-?}" "$sel_port"
+            ui_line
+            echo "    1  probe   active tests only  (DNS + reachability + connectivity)"
+            echo "    2  trace   capture + analyze  (up to ${CAPTURE_DURATION_DEFAULT}s, Ctrl-C to stop)"
+            echo "    3  run     everything         (probe + trace + report)"
+            ui_line
+            echo "    8  change target      9  quit"
+            printf "Select [1-3, 8, 9]> "; read -r a
+            case "$a" in
+                1) do_probe "$tgt" "$sel_port"; generate_html_report ;;
+                2) do_trace "$tgt" "$sel_port"; generate_html_report ;;
+                3) do_run   "$tgt" "$sel_port" ;;
+                8) break ;;
+                9|q|Q) echo "Leaving interactive mode."; return 0 ;;
+                *) echo "Invalid choice." ;;
+            esac
+        done
+    done
 }
 
 # ==============================================================================
@@ -1365,31 +1686,64 @@ HTMLEOF
 
 # Show help
 show_help() {
-    echo "Network Diagnostics Script"
-    echo "--------------------------"
-    echo "Usage: $0 [command]"
-    echo ""
-    echo "Commands:"
-    echo "  install                 Detect OS and install required networking tools."
-    echo "                          (Requires root/sudo privileges)"
-    echo ""
-    echo "  <fqdn_or_ip>            Test connectivity to <fqdn_or_ip> on ports 80 and 443."
-    echo "                          Prompts for a log file location."
-    echo ""
-    echo "  <fqdn_or_ip> <port>     Test connectivity to <fqdn_or_ip> on the specified <port>."
-    echo "                          Prompts for a log file location."
-    echo ""
-    echo "  run                     Run interactive diagnostics."
-    echo "                          - Detects outbound connections (via netstat)"
-    echo "                          - Prompts for target"
-    echo "                          - Runs nslookup, connectivity, and latency tests"
-    echo "                          - Captures 1 minute of packets (requires root/sudo)"
-    echo ""
-    echo "  help (or no args)       Show this help message."
-    echo ""
-    echo "Global Log File: $LOG_FILE"
-    echo "Packet Captures: $PACKET_CAPTURE_FILE (for 'run' mode)"
-    echo "HTML Report:     $LOG_DIR/nwutils_report.html"
+    cat <<EOF
+nwutils v$SCRIPT_VERSION — Linux Network Troubleshooting Utility
+Works on any Linux: Azure App Service (Kudu & containers), Container Apps, AKS,
+Azure / AWS / GCP VMs, and local VMs.
+
+USAGE
+  nwutils <command> [host] [port] [options]
+
+SETUP
+  install               Install the FULL networking toolkit.
+  check                 Inventory which tools are installed.
+
+ACTIVE (live tests, no capture)
+  probe   <host> [port] DNS + reachability + connectivity tests, now.
+
+PASSIVE (packet evidence)
+  trace   <host> [port] Capture + analyze in one go
+                        (up to ${CAPTURE_DURATION_DEFAULT}s; press Ctrl-C to stop early).
+  capture <host> [port] Record a tcpdump (.pcap) only.
+  analyze <file.pcap>   Analyze an existing capture (offline).
+
+EVERYTHING
+  run     <host> [port] probe + trace + unified report.
+
+GUIDED / MANUAL
+  interactive           Menu UI: pick a connection, choose probe/trace/run.
+                        (aliases: int, i, menu)
+  suggest [host] [port] Print copy-paste commands for your target
+                        (no host = generic cheatsheet).
+
+MISC
+  help · version
+
+OPTIONS
+  -d, --duration <sec>  Capture length for capture/trace/run (default: ${CAPTURE_DURATION_DEFAULT}).
+      --ascii           Plain-ASCII UI (no box-drawing characters).
+
+MENTAL MODEL
+  probe = active   ·   trace = passive (capture + analyze)   ·   run = both
+  capture and analyze are the atomic halves of trace. Port defaults to 443.
+
+TYPICAL WORKFLOWS
+  Do it all:               nwutils run api.example.com 443
+  Live tests only:         nwutils probe api.example.com 443
+  Trace then read:         nwutils trace api.example.com 443
+  Capture now, read later: nwutils capture api.example.com 443 -d 300
+                           nwutils analyze /path/to/capture.pcap
+  Guided menu:             nwutils interactive
+  By hand:                 nwutils install && nwutils suggest api.example.com 443
+
+NOTES
+  • install & capture/trace need root/sudo. probe & analyze do not.
+  • A bare 'nwutils <host> [port]' is shorthand for 'nwutils run <host> [port]'.
+  • Ctrl-C during a capture stops tcpdump and proceeds straight to analysis.
+
+Log file:    $LOG_FILE
+HTML report: $LOG_DIR/nwutils_report.html
+EOF
 }
 
 # Show script version
@@ -1398,62 +1752,102 @@ show_version() {
 }
 
 # ==============================================================================
-# MAIN SCRIPT
-# Parse command-line arguments
+# MAIN SCRIPT — argument parsing and command dispatch
 # ==============================================================================
 
-# No arguments: Show help
+# ── Parse global options out of the argument list, keep positionals in order ──
+DURATION="$CAPTURE_DURATION_DEFAULT"
+POSargs=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -d|--duration)
+            DURATION="$2"; shift 2
+            if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+                echo "Error: --duration requires a number of seconds."; exit 1
+            fi
+            ;;
+        --ascii)      USE_ASCII=1; shift ;;
+        -h|--help)    show_help; exit 0 ;;
+        -v|--version) show_version; exit 0 ;;
+        --)           shift; while [ "$#" -gt 0 ]; do POSargs+=("$1"); shift; done ;;
+        # Any other -word (e.g. -probe) is treated as a positional so dashed
+        # command forms still work; the leading dash is normalized below.
+        *) POSargs+=("$1"); shift ;;
+    esac
+done
+set -- "${POSargs[@]}"
+
+# No positional args: show help
 if [ "$#" -eq 0 ]; then
     show_help
     exit 0
 fi
 
-# Handle specific commands first
-case "$1" in
+# Normalize a leading dash on a verb (e.g. -probe → probe, --run → run)
+CMD="$1"; CMD="${CMD#-}"; CMD="${CMD#-}"
+
+case "$CMD" in
     install)
-        install_tools
-        exit $?
-        ;;
-    run)
-        run_interactive
-        exit $?
-        ;;
+        install_tools; exit $? ;;
+    check)
+        check_inventory; exit $? ;;
+    interactive|int|i|menu)
+        run_interactive; exit $? ;;
+    suggest)
+        suggest_commands "$2" "$3"; exit 0 ;;
     help)
-        show_help
+        show_help; exit 0 ;;
+    version)
+        show_version; exit 0 ;;
+    probe|trace|capture|run)
+        HOST="$2"
+        if [ -z "$HOST" ]; then
+            log_message "Error: '$CMD' requires a host. Example: nwutils $CMD api.example.com 443"
+            exit 1
+        fi
+        if ! validate_host "$HOST"; then
+            log_message "Error: Invalid hostname or IP: '$HOST'"
+            exit 1
+        fi
+        PORT="${3:-443}"
+        if ! validate_port "$PORT"; then
+            log_message "Error: Invalid port: '$PORT'. Must be 1-65535."
+            exit 1
+        fi
+        case "$CMD" in
+            probe)   do_probe   "$HOST" "$PORT";              generate_html_report ;;
+            capture) do_capture  "$HOST" "$PORT" "$DURATION" ;;
+            trace)   do_trace    "$HOST" "$PORT" "$DURATION"; generate_html_report ;;
+            run)     do_run      "$HOST" "$PORT" "$DURATION" ;;
+        esac
         exit 0
         ;;
-    -h|--help)
-        show_help
+    analyze)
+        PCAP="$2"
+        if [ -z "$PCAP" ]; then
+            log_message "Error: 'analyze' requires a .pcap file. Example: nwutils analyze trace.pcap [host] [port]"
+            exit 1
+        fi
+        do_analyze "$PCAP" "$3" "$4"
+        generate_html_report
         exit 0
         ;;
-    -v|--version)
-        show_version
-        exit 0
+    *)
+        # Backward-compatible shorthand: 'nwutils <host> [port]' == 'nwutils run ...'
+        HOST="$1"
+        if validate_host "$HOST"; then
+            PORT="${2:-443}"
+            if ! validate_port "$PORT"; then
+                log_message "Error: Invalid port: '$PORT'. Must be 1-65535."
+                exit 1
+            fi
+            do_run "$HOST" "$PORT" "$DURATION"
+            exit 0
+        fi
+        log_message "Error: Unknown command or invalid host: '$1'"
+        show_help
+        exit 1
         ;;
 esac
-
-# --- Handle FQDN/IP commands ---
-# If not above (install, run, help), the cmdline arguments must be fqdn/ip and/or port number
-
-TARGET_PORT=""
-TARGET_FQDN="$1"
-if ! validate_host "$TARGET_FQDN"; then
-    log_message "Error: Invalid hostname or IP: '$TARGET_FQDN'"
-    exit 1
-fi
-if [ "$#" -eq 1 ]; then
-    test_connectivity "$TARGET_FQDN" "80" "443"
-elif [ "$#" -eq 2 ]; then
-    TARGET_PORT="$2"
-    if ! validate_port "$TARGET_PORT"; then
-        log_message "Error: Invalid port specified: '$TARGET_PORT'. Must be a number between 1 and 65535."
-        exit 1
-    fi
-    test_connectivity "$TARGET_FQDN" "$TARGET_PORT"
-else
-    log_message "Error: Incorrect or too many arguments provided"
-    show_help
-    exit 1
-fi
 
 exit 0
